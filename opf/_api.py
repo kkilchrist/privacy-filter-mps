@@ -190,7 +190,7 @@ class OPF:
         model: str | os.PathLike[str] | None = None,
         context_window_length: int | None = None,
         trim_whitespace: bool = True,
-        device: Literal["cpu", "cuda"] = "cuda",
+        device: Literal["auto", "cpu", "cuda", "mps"] = "auto",
         output_mode: Literal["typed", "redacted"] = "typed",
         decode_mode: Literal["viterbi", "argmax"] = "viterbi",
         discard_overlapping_predicted_spans: bool = False,
@@ -206,7 +206,8 @@ class OPF:
             context_window_length: Optional override for the runtime context
                 window length.
             trim_whitespace: Whether to trim whitespace from detected spans.
-            device: Inference device name.
+            device: Inference device name. ``"auto"`` (default) picks the
+                best available backend: ``cuda`` > ``mps`` > ``cpu``.
             output_mode: ``"typed"`` to preserve model labels or
                 ``"redacted"`` to collapse them.
             decode_mode: ``"viterbi"`` or ``"argmax"``.
@@ -286,7 +287,7 @@ class OPF:
         self._invalidate_runtime()
         return self
 
-    def set_device(self, *, device: Literal["cpu", "cuda"]) -> OPF:
+    def set_device(self, *, device: Literal["auto", "cpu", "cuda", "mps"]) -> OPF:
         """Update the inference device.
 
         Args:

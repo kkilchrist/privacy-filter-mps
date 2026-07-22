@@ -59,7 +59,8 @@ def _resolve_preprocess_workers(requested: int, *, device: torch.device) -> int:
     if requested < 0:
         raise ValueError("--preprocess-workers must be >= 0")
     if requested == 0:
-        if device.type != "cuda":
+        if device.type == "cpu":
+            # On CPU the forward pass competes with preprocessing for cores.
             return 1
         cpu_count = os.cpu_count() or 1
         return max(1, min(8, cpu_count - 1))

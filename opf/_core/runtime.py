@@ -141,8 +141,11 @@ def _resolve_n_ctx(
         if override_n_ctx <= 0:
             raise ValueError("n_ctx must be positive")
         return override_n_ctx
-    if device.type == "cpu":
-        # CPU full-eval/demo should default to a safer context size.
+    if device.type != "cuda":
+        # CPU and MPS default to a safer context size. Larger windows do not
+        # improve throughput (windows are non-overlapping and the attention
+        # band is ±128 tokens) but scale transient memory with window length,
+        # which can OOM unified-memory Apple devices at the 128k default.
         return 4096
 
     for field_name in (

@@ -67,6 +67,51 @@ def _batched_linear_with_parity(
     return out
 
 
+def _torch_grouped_matmul(
+    a_packed: torch.Tensor,
+    weights: torch.Tensor,
+    expert_ids_sorted: torch.Tensor,
+    offsets: torch.Tensor,
+    counts: torch.Tensor,
+    *,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Apply expert-specific linear projections to packed token rows in torch.
+
+    Pure-torch equivalent of the Triton ``grouped_matmul`` kernel for devices
+    Triton cannot target (e.g. Apple MPS). Rows are scattered into a padded
+    per-expert batch, multiplied with one ``bmm``, and gathered back, so each
+    expert's weights are read once per call instead of once per token.
+    """
+    if a_packed.dim() != 2 or weights.dim() != 3:
+        raise ValueError(
+            "_torch_grouped_matmul expects a_packed [M,K] and weights [E,K,N]"
+        )
+    num_experts, k_dim, n_dim = weights.shape
+    n_rows = a_packed.shape[0]
+    if a_packed.shape[1] != k_dim:
+        raise ValueError(
+            "_torch_grouped_matmul shape mismatch: "
+            f"a{tuple(a_packed.shape)} w{tuple(weights.shape)}"
+        )
+    if out_dtype is None:
+        out_dtype = torch.float32
+    max_count = int(counts.max().item()) if counts.numel() and n_rows else 0
+    if max_count == 0:
+        return torch.zeros((n_rows, n_dim), device=a_packed.device, dtype=out_dtype)
+    if a_packed.dtype != weights.dtype:
+        a_packed = a_packed.to(weights.dtype)
+    # Rank of each packed row inside its expert's contiguous block.
+    rank = (
+        torch.arange(n_rows, device=a_packed.device)
+        - offsets.to(torch.long)[expert_ids_sorted]
+    )
+    padded = a_packed.new_zeros((num_experts, max_count, k_dim))
+    padded[expert_ids_sorted, rank] = a_packed
+    out_padded = torch.bmm(padded, weights)
+    return out_padded[expert_ids_sorted, rank].to(out_dtype)
+
+
 PRIVACY_FILTER_MODEL_TYPE = "privacy_filter"
 REQUIRED_ENCODER_CONFIG_KEYS: tuple[str, ...] = (
     "model_type",
@@ -757,13 +802,20 @@ class MLPBlock(torch.nn.Module):
         use_triton = get_env_bool("OPF_MOE_TRITON", default=is_cuda_device)
         if use_triton:
             _require_triton()
+        # The grouped path packs tokens by expert so each expert's weights are
+        # read once per call. On MPS it uses pure-torch batched matmuls (Triton
+        # cannot target Metal); the per-token gather fallback stays the CPU
+        # default. Override with OPF_MOE_GROUPED.
+        use_grouped = use_triton or get_env_bool(
+            "OPF_MOE_GROUPED", default=t.device.type == "mps"
+        )
 
         def _moe_chunk(
             t_chunk: torch.Tensor,
             expert_indices_chunk: torch.Tensor,
             expert_weights_chunk: torch.Tensor,
         ) -> torch.Tensor:
-            if use_triton:
+            if use_grouped:
                 n_tokens = t_chunk.shape[0]
                 k = expert_indices_chunk.shape[1]
                 expert_ids = expert_indices_chunk.reshape(-1)
@@ -787,13 +839,25 @@ class MLPBlock(torch.nn.Module):
                 if a_packed.dtype != w1.dtype:
                     a_packed = a_packed.to(w1.dtype)
                 w2 = self.mlp2_weight
-                h_pre = grouped_matmul(
-                    a_packed, w1, offsets, counts, out_dtype=w1.dtype
-                )
+                if use_triton:
+                    h_pre = grouped_matmul(
+                        a_packed, w1, offsets, counts, out_dtype=w1.dtype
+                    )
+                else:
+                    h_pre = _torch_grouped_matmul(
+                        a_packed,
+                        w1,
+                        expert_ids_sorted,
+                        offsets,
+                        counts,
+                        out_dtype=w1.dtype,
+                    )
                 b1 = self.mlp1_bias[expert_ids_sorted]
                 h_pre = h_pre + b1
-                use_fused_w2 = (not self.packed_geglu) and get_env_bool(
-                    "OPF_MOE_FUSED_SWIGLU_W2", default=True
+                use_fused_w2 = (
+                    use_triton
+                    and (not self.packed_geglu)
+                    and get_env_bool("OPF_MOE_FUSED_SWIGLU_W2", default=True)
                 )
                 if use_fused_w2:
                     if h_pre.dtype != w2.dtype:
@@ -815,7 +879,19 @@ class MLPBlock(torch.nn.Module):
                     )
                     if h.dtype != w2.dtype:
                         h = h.to(w2.dtype)
-                    o = grouped_matmul(h, w2, offsets, counts, out_dtype=w2.dtype)
+                    if use_triton:
+                        o = grouped_matmul(
+                            h, w2, offsets, counts, out_dtype=w2.dtype
+                        )
+                    else:
+                        o = _torch_grouped_matmul(
+                            h,
+                            w2,
+                            expert_ids_sorted,
+                            offsets,
+                            counts,
+                            out_dtype=w2.dtype,
+                        )
                     b2 = self.mlp2_bias[expert_ids_sorted]
                     o = o + b2
                 if self.world_size > 1:
@@ -869,7 +945,7 @@ class MLPBlock(torch.nn.Module):
             out = out * experts_per_token_eff
             return out.to(x.dtype)
 
-        if use_triton:
+        if use_grouped:
             effective_batch = 0
         else:
             effective_batch = self.torch_ops_batch

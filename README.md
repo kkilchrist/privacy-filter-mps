@@ -36,11 +36,13 @@ By default, `opf` looks for a model at the directory pointed to by the `OPF_CHEC
 opf "Alice was born on 1990-01-02."
 ```
 
-The code supports running both on GPU (by default) and CPU. To run on CPU, use `--device cpu` flag:
+The code supports running on NVIDIA GPUs (CUDA), Apple silicon GPUs (MPS), and CPU. By default the best available backend is picked automatically (`cuda` > `mps` > `cpu`). To force a specific device, use the `--device` flag:
 
 ```bash
 opf --device cpu "Alice was born on 1990-01-02."
 ```
+
+On Apple silicon, inference runs on the GPU via PyTorch MPS. The mixture-of-experts layers use a grouped pure-torch path there (Triton kernels are CUDA-only); set `OPF_MOE_GROUPED=0` to fall back to the per-token torch path. Measured speedup over CPU is substantial (~65x on an M4 Pro with a 20-core GPU) but scales with GPU core count and memory bandwidth, so expect proportionally less on smaller M-series chips.
 
 To override the default checkpoint, pass `--checkpoint`:
 

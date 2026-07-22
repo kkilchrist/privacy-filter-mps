@@ -209,7 +209,10 @@ class Checkpoint:
             sub[:, 0::2] = lut[idx_lo]
             sub[:, 1::2] = lut[idx_hi]
 
-            torch.ldexp(sub, exp, out=sub)
+            # Equivalent to torch.ldexp(sub, exp): scaling by an exact power
+            # of two. Written as an exp2 multiply because ldexp has no MPS
+            # kernel.
+            sub.mul_(torch.exp2(exp.to(sub.dtype)))
             del idx_lo, idx_hi, blk, exp
 
         return out.reshape(*prefix_shape, G, B * 2).view(*prefix_shape, G * B * 2)
